@@ -2617,8 +2617,12 @@ contract NftStore is Governable{   //buy with BUSD
     uint public maxNft;
     uint public curNft;
     uint public emaPeriod;
-    uint[] public maxNfts;
-    uint[] public curNfts;
+
+    
+    mapping(uint => uint) public maxNfts; //Nft index=>maxNfts
+    mapping(uint => uint) public curNfts; //Nft index=>curNfts
+    
+    mapping(address => bool) public admAddrs;
     
     function __NftStore_init(address governor_, address daoFarmer_,uint begin_, uint span_,address currency_,address routerAddr_) external initializer {
 		__Governable_init_unchained(governor_);
@@ -2635,20 +2639,30 @@ contract NftStore is Governable{   //buy with BUSD
         routerAddr = routerAddr_;
     }
 
-    function setMaxNft(uint maxNft_,uint[] calldata maxNfts_) public governance {
+    function setadm(address adm_,bool isAdm) public governance {
+         admAddrs[adm_] = isAdm;
+    }
+
+
+    function setMaxNft(uint maxNft_,uint[] calldata maxNfts_) public  {
+         require(admAddrs[msg.sender]||governor==msg.sender,"No permission");
          maxNft = maxNft_;
-         maxNfts= maxNfts_;
+         uint len = maxNfts_.length;
+         for (uint i=0;i<len;i++){
+            maxNfts[i] = maxNfts_[i];
+         }
     }
     
-    function setEmaPeriod(uint emaPeriod_) public governance {
+    function setEmaPeriod(uint emaPeriod_) public  {
+         require(admAddrs[msg.sender]||governor==msg.sender,"No permission");
          emaPeriod = emaPeriod_;
     }
     
     function calcEma(uint256 emaPre, uint256 value, uint256 timeSpan, uint256 period) public pure returns(uint256) {
         if (timeSpan == 0)
             return emaPre;
-        if(timeSpan > period)
-            timeSpan = period;
+        if(timeSpan > period/2)
+            timeSpan = period/2;
         return (emaPre*(period-timeSpan)+value*timeSpan)/period;
     }
 
