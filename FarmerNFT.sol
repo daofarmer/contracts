@@ -2770,21 +2770,56 @@ contract NftStore is Governable{   //buy with BUSD
 
 
 
+contract NftExchangeNftOrERC20 is Governable,ContextUpgradeable,IERC721ReceiverUpgradeable {    // src NFT exchange des NFT  or des  erc20 only one NFT
 
-contract NftExchangeNftOrERC20 is Governable,ContextUpgradeable,IERC721ReceiverUpgradeable {    // src NFT exchange des NFT  or des  erc20
+    address internal constant BurnAddress   = 0x000000000000000000000000000000000000dEaD;
+    uint public begin;
+    uint public end;
+    address public mine;
+    mapping(address => mapping(uint256 => uint256)) public NftSrcId2PackIds;//NFTtoken address => token id =>PackId
+    //uint[] public allNftId2TypeId;  //token id =>typeId
+    //TypeID
+    //1.Stick    Nft 0
+    //2.Axe      Nft 3   
+    //3.Mattock  Nft 6
+    //4.Meat Resource Package  erc 1
+    //5.Wood Resource Package  erc 2
+    //6.Gold Resource Package  erc 3
+    using EnumerableSetUpgradeable for EnumerableSetUpgradeable.UintSet;
+    mapping(uint => EnumerableSetUpgradeable.UintSet) private packId2ItemIds;  //PackId =>item id set
+    /*
+    type ID        items
+    1              1
+    2              2
+    3              3
+    4              5 6
+    5              4 7
+    6              4 8
+    */
 
     struct SToken {
         uint tokenType; //0 None 1 erc20  2 erc721 NFT
         address token;
         uint  volume;
     }
-
-    uint public begin;
-    uint public end;
-
-    mapping(address => SToken) public NftExMaps;
- 
-
+    mapping(uint => SToken) public items; //itemId=>item
+    //items:
+    //1. NFT   stickAddr 1    // 1.Stick    Nft 0
+    //2. NFT   AxeAddr   1    // 2.Axe      Nft 3   
+    //3. NFT   PICKAddr  1    // 3.Mattock  Nft 6
+    //4. ERC20 DAOFAddr  2  
+    //5. ERC20 DAOFAddr  3  
+    //6. ERC20 DFMAddr   1000  
+    //7. ERC20 DFWAddr   500  
+    //8. ERC20 DFGAddr   500  
+    
+    
+    //4.Meat Resource Package  erc 1
+    //5.Wood Resource Package  erc 2
+    //6.Gold Resource Package  erc 3
+    //meat:3DAOF+1000DFM
+    //wood:2DAOF+500DFW
+    //gold:2DAOF+500DFG
 
    function __NftExchangeNftOrERC20_init(address governor_) external initializer {
 		__Governable_init_unchained(governor_);
@@ -2805,9 +2840,31 @@ contract NftExchangeNftOrERC20 is Governable,ContextUpgradeable,IERC721ReceiverU
  
     }*/
  
+    function setMine(address mine_)  public governance{
+        mine = mine_;
+    }
 
-    function setNftEx(address Nft_,uint type_,address desToken, uint vol_)  public governance{
-        NftExMaps[Nft_] = SToken(type_,desToken,vol_);
+    function setNftSrcId2PackIds(address NftSrc_,uint[] calldata tokenId,uint[] calldata packId)  public governance{
+        uint len = tokenId.length;
+        require(len==packId.length,"tokenId num != typeId num");
+        for (uint i=0;i<len;i++){
+            NftSrcId2PackIds[NftSrc_][tokenId[i]] = packId[i];
+        }
+    }
+
+    function setItems(uint[] calldata itemIds_,SToken[] calldata items_)  public governance{
+        uint len = itemIds_.length;
+        require(len==items_.length,"itemid num != item num");
+        for (uint i=0;i<len;i++){
+            items[itemIds_[i]] = items_[i];    
+        }
+    }
+
+    function setPackId2ItemIds(uint packId_,uint[] memory items_)  public governance{
+        uint len = items_.length;
+        for (uint i=0;i<len;i++){
+            packId2ItemIds[packId_].add(items_[i]);
+        }
     }
 
 
@@ -2817,22 +2874,43 @@ contract NftExchangeNftOrERC20 is Governable,ContextUpgradeable,IERC721ReceiverU
         end = end_;
     }
 
-    function nftExchange(address nft,uint tokenId) public{
+    function getNftTokenIds(address NFT_,address account) public view returns(uint[] memory ids){
+        uint n = EquipNFT(NFT_).balanceOf(account);
+        ids = new uint[](n);
+        for (uint i=0;i<n;i++){
+            ids[i] = EquipNFT(NFT_).tokenOfOwnerByIndex(account,i);
+        }
+    } 
+
+    function nftExchange(address nft) public{
         require(block.timestamp>=begin,"Not start");
         require(block.timestamp<=end,"exchange end");
-        uint tokenType = NftExMaps[nft].tokenType;
-        require(tokenType >0,"No exchange this NFT");
-        EquipNFT(nft).safeTransferFrom(msg.sender,address(this),tokenId);
-        if (tokenType == 1){ //erc20
-            TransferHelper.safeTransfer(NftExMaps[nft].token,msg.sender,NftExMaps[nft].volume);       
-        }else if(tokenType == 2){ //NFT
-            for(uint i=0;i<NftExMaps[nft].volume;i++){
-                EquipNFT(NftExMaps[nft].token).mint(msg.sender,"");
+        uint[] memory ids =  getNftTokenIds(nft,msg.sender);
+        uint idCount = ids.length;
+        for (uint i = 0;i<idCount;i++){
+            uint packId = NftSrcId2PackIds[nft][ids[i]];
+            uint itemCount = packId2ItemIds[packId].length();
+            if (packId==0)
+                continue;
+            EquipNFT(nft).safeTransferFrom(msg.sender,BurnAddress,ids[i]);
+            for (uint j=0;j<itemCount;j++){
+                uint itemId = packId2ItemIds[packId].at(j);
+                SToken memory st = items[itemId];
+                if (st.tokenType == 1){ // erc20
+                    TransferHelper.safeTransferFrom(st.token,mine,msg.sender,st.volume);
+                }
+                else if(st.tokenType == 2){ //NFT
+                    uint vol = st.volume;
+                    for (uint k=0;k<vol;k++){
+                        EquipNFT(st.token).mint(msg.sender,"");
+                    }
+                }
+
             }
         }
-        emit NftExchange(nft,tokenId);
+        emit NftExchange(nft,ids,msg.sender);
     }
-    event  NftExchange(address nft,uint tokenId);
+    event  NftExchange(address nft,uint[] tokenIds,address account);
 
     
     function withdrawTokens(address _token, address _dst) public governance {
@@ -2846,7 +2924,6 @@ contract NftExchangeNftOrERC20 is Governable,ContextUpgradeable,IERC721ReceiverU
     }
     
 
-
     function onERC721Received(address, address, uint256, bytes calldata) external override pure returns (bytes4) {
         return this.onERC721Received.selector;
     }
@@ -2854,8 +2931,7 @@ contract NftExchangeNftOrERC20 is Governable,ContextUpgradeable,IERC721ReceiverU
 }
 
 
-
-contract DaoFarmer is Governable,IERC721ReceiverUpgradeable,AccessControlEnumerableUpgradeable {
+contract DaoFarmer is Configurable,IERC721ReceiverUpgradeable,AccessControlEnumerableUpgradeable {
     uint private constant DAOF = 0;
     uint private constant FOOD = 1;
     uint private constant WOOD = 2;
@@ -3001,8 +3077,8 @@ contract DaoFarmer is Governable,IERC721ReceiverUpgradeable,AccessControlEnumera
         uint value1 = item1.value;
         uint value2 = item2.value;
         
-        TransferHelper.safeTransferFrom(erc1, msg.sender, address(this), value1);
-        TransferHelper.safeTransferFrom(erc2, msg.sender, address(this), value2);
+        TransferHelper.safeTransferFrom(erc1, msg.sender, BurnAddress, value1);
+        TransferHelper.safeTransferFrom(erc2, msg.sender, BurnAddress, value2);
 
         tokenId = prop.mint(msg.sender,"");
         _addPowerByNewEquip(msg.sender,propId);
@@ -3261,19 +3337,52 @@ contract DaoFarmer is Governable,IERC721ReceiverUpgradeable,AccessControlEnumera
         }
     }
 
-
-    function getTestToken() public {
+    //0 DAOF:200, 1 DFM:10000, 2 DFW:150000, 3 DFG:150000  WUSD:50000；
+    /*function getTestToken() public {
         for (uint i = 0; i < 4; i++) {
             address erc1 = ercList[i];
             if (i==0)
+                TransferHelper.safeTransfer(erc1, msg.sender,200 ether);
+            else if (i==1)
                 TransferHelper.safeTransfer(erc1, msg.sender,10000 ether);
+            else if (i==2)
+                TransferHelper.safeTransfer(erc1, msg.sender,150000 ether);                                
             else
-                TransferHelper.safeTransfer(erc1, msg.sender,20000 ether);
+                TransferHelper.safeTransfer(erc1, msg.sender,150000 ether);
         }
-        TransferHelper.safeTransfer(0x51EB4F461339764Ec6FAa67104116e4A92C86612, msg.sender,5000 ether);
+        TransferHelper.safeTransfer(0x51EB4F461339764Ec6FAa67104116e4A92C86612, msg.sender,50000 ether);
         
-    }
+    }*/
  
+}
+
+
+contract Mine is Governable {
+    //using SafeERC20 for IERC20;
+
+    address public reward;
+
+    function __Mine_init(address governor, address reward_) public initializer {
+        __Governable_init_unchained(governor);
+        __Mine_init_unchained(reward_);
+    }
+    
+    function __Mine_init_unchained(address reward_) public governance {
+        reward = reward_;
+    }
+    
+    function approvePool(address pool, uint amount) public governance {
+        //IERC20(reward).approve(pool, amount);
+        TransferHelper.safeApprove(reward,pool,amount);
+    }
+    
+    function approveToken(address token, address pool, uint amount) public governance {
+        //IERC20(token).approve(pool, amount);
+        TransferHelper.safeApprove(token,pool,amount);
+    }
+
+    // Reserved storage space to allow for layout changes in the future.
+    uint256[50] private ______gap;
 }
 
 
