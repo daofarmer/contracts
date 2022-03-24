@@ -2623,6 +2623,9 @@ contract NftStore is Governable{   //buy with BUSD
     mapping(uint => uint) public curNfts; //Nft index=>curNfts
     
     mapping(address => bool) public admAddrs;
+
+    mapping(uint => uint) public nftRewardDaofs; //Nft index=>reward daof vol
+    uint public discount; //?%
     
     function __NftStore_init(address governor_, address daoFarmer_,uint begin_, uint span_,address currency_,address routerAddr_) external initializer {
 		__Governable_init_unchained(governor_);
@@ -2635,12 +2638,15 @@ contract NftStore is Governable{   //buy with BUSD
         currency = currency_;
         begin = begin_;
         span =span_;
-        currency = currency_;
         routerAddr = routerAddr_;
     }
 
     function setadm(address adm_,bool isAdm) public governance {
          admAddrs[adm_] = isAdm;
+    }
+
+    function setDiscount(uint discount_) public governance {
+         discount = discount_;
     }
 
 
@@ -2652,6 +2658,17 @@ contract NftStore is Governable{   //buy with BUSD
             maxNfts[i] = maxNfts_[i];
          }
     }
+
+    function setNftRewardDaofs(uint[] calldata nftIndex,uint[] calldata nftDaofs) public  {
+         require(admAddrs[msg.sender]||governor==msg.sender,"No permission");
+         uint len = nftIndex.length;
+         require(len==nftDaofs.length,"nft num != reward dao  num"); 
+         for (uint i=0;i<len;i++){
+            nftRewardDaofs[nftIndex[i]] = nftDaofs[i];
+         }
+    }
+
+
     
     function setEmaPeriod(uint emaPeriod_) public  {
          require(admAddrs[msg.sender]||governor==msg.sender,"No permission");
@@ -2718,7 +2735,7 @@ contract NftStore is Governable{   //buy with BUSD
         uint[4] memory emas = getItemEmaPrices();
         uint price1 = prices[item1.itemType]>emas[item1.itemType]?prices[item1.itemType]:emas[item1.itemType];
         uint price2 = prices[item2.itemType]>emas[item2.itemType]?prices[item2.itemType]:emas[item2.itemType];
-        return price1*value1/(1 ether) + price2*value2/(1 ether);
+        return (price1*value1/(1 ether) + price2*value2/(1 ether))*discount/100;
     }
 
     function getPrice(address[] memory path) public view returns(uint amt){
@@ -2742,6 +2759,9 @@ contract NftStore is Governable{   //buy with BUSD
         TransferHelper.safeTransferFrom(currency, msg.sender, df.vault(), amt*94/100);
         tokenId = prop.mint(msg.sender,"");
         df.addPowerByNewEquip(msg.sender,propID);
+        //reward daof
+        if (nftRewardDaofs[propID]>0)
+            TransferHelper.safeTransferFrom(df.ercList(0), df.mine(),msg.sender,nftRewardDaofs[propID]);
         emit Buy(msg.sender,df.nftList(propID),tokenId,block.timestamp);
     }
     
@@ -2946,7 +2966,7 @@ contract DaoFarmer is Configurable,IERC721ReceiverUpgradeable,AccessControlEnume
     uint private constant PICK = 6;
     uint private constant RIG = 7;
      
-    address private constant BurnAddress   = 0x000000000000000000000000000000000000dEaD;
+    address public constant BurnAddress   = 0x000000000000000000000000000000000000dEaD;
     bytes32 public constant POWER_ROLE = keccak256("POWER_ROLE");
     
     
@@ -2968,25 +2988,321 @@ contract DaoFarmer is Configurable,IERC721ReceiverUpgradeable,AccessControlEnume
     mapping(address => EnumerableSetUpgradeable.UintSet) private stakeEquip; 
     mapping (uint =>mapping(address =>uint)) public poolStakes;//poolID=>address=>value stakeDAOF
     uint public stakeDAOFvol;
+
+    //auto farm
+    struct NftAuto {
+        uint    startTime;
+        uint    lastClaimTime;
+        uint    totalReward;
+    }
+
+/*    struct NftInfo{
+        uint costPower;
+        uint coolDown;
+        uint costDurability;
+        uint curDurability;
+        uint lastTime;
+        uint times;
+        address erc1;
+        uint fee;
+        uint realValue;
+        uint tecFee;
+        address recomm;
+    }*/
+
+    struct RecommInfo{
+        uint invitedNum;       //invited num
+        uint[4] inviteRewardAmt;  //total reward DAOF
+    }
+
+
+    mapping(address => EnumerableSetUpgradeable.UintSet) private stakeEquipAuto; 
+    uint public medalDAOFvol;
+    mapping(address => uint) public medalDAOFs; //account =>daofVol   medal
+    mapping(address => address) public recommenders; //account =>Recommenders    account's recommender
+    mapping(address => RecommInfo) public recommInfos; //recommender =>recommInfo
+    mapping(uint =>mapping(uint =>NftAuto)) public nftAutos; //Nft propId =>Nft tokenID =>NftAuto  
+    address public tecSev;
+    mapping (uint =>mapping(address =>uint)) public poolStakeEndTime; //poolID=>address=>takeDAOFendTime;
+    mapping(address => uint) public farmAutoNum;  //autoFarm times
+
+ 
+    function recommInfo(address account) public view returns(uint invitedNum,uint[4] memory inviteRewardAmt){
+        RecommInfo memory ri = recommInfos[account];
+        invitedNum = ri.invitedNum;
+        inviteRewardAmt = ri.inviteRewardAmt;
+    }
+
+
+    function medal() public  {
+        uint medalDaofV = medalDAOFs[msg.sender];
+        require(medalDaofV<medalDAOFvol,"exist medal");
+        uint realV =  medalDAOFvol - medalDaofV;
+        address erc1 = ercList[DAOF];
+        TransferHelper.safeTransferFrom(erc1, msg.sender,BurnAddress,realV);
+        medalDAOFs[msg.sender] = medalDAOFvol;
+    }
+
+    function setRecommender(address recomm) public {
+        require(recommenders[msg.sender]==address(0),"exist recommender");
+        require(medalDAOFs[recomm]>=medalDAOFvol,"no medal");
+        require(recommenders[recomm]!=msg.sender,"loop recommender");
+        recommenders[msg.sender] = recomm;
+        recommInfos[recomm].invitedNum +=1;
+    }
+
+
+
+    function farmAuto(uint propId,uint tokenId) public  {
+        claimFarmAutoAllAType(getPropOutErcIndex(propId));
+        DaoFarmerLib.farmAuto(nftAutos,recommInfos,poolStakeEndTime,propId,tokenId);
+        farmAutoNum[msg.sender] += 1;
+/*        EquipNFT prop = EquipNFT(nftList[propId]);
+        EquipNFT.Item memory item1;
+        NftInfo memory nftInfo;
+        farmAutoNum[msg.sender] += 1;
+        (,,item1,,,nftInfo.costDurability,nftInfo.costPower,nftInfo.coolDown)=prop.property();
+        (nftInfo.curDurability,nftInfo.lastTime) = prop.curPropertys(tokenId);
+        require(block.timestamp-nftInfo.lastTime >nftInfo.coolDown,"cooling down");
+        nftInfo.times = 48*60*60/nftInfo.coolDown;
+        prop.costDur(tokenId,true);
+        prop.setDur(tokenId,nftInfo.curDurability - nftInfo.costDurability*nftInfo.times);
+        uint meatVol = nftInfo.costPower*nftInfo.times*1e18/5;
+        TransferHelper.safeTransferFrom(ercList[FOOD], msg.sender, BurnAddress, meatVol);
+
+
+        nftInfo.erc1 = ercList[item1.itemType];
+        uint value1 = item1.value*nftInfo.times;
+        if (poolStakes[item1.itemType][msg.sender]>=stakeDAOFvol){ //stake
+            poolStakeEndTime[item1.itemType][msg.sender] = block.timestamp+48*60*60;
+            value1 = value1*106/100;
+        }
+        nftInfo.fee =value1*4/100;
+        nftInfo.realValue = value1 - 2*nftInfo.fee;  //92%
+
+
+        TransferHelper.safeTransferFrom(nftInfo.erc1, mine, vault, nftInfo.fee);
+        TransferHelper.safeTransferFrom(nftInfo.erc1, mine, eco, nftInfo.fee);
+
+        //no recommender 6.5% tecsev
+        //recommender 4% ,  1% tecsev
+        nftInfo.recomm = recommenders[msg.sender];
+        if (nftInfo.recomm == address(0)){
+            nftInfo.tecFee = nftInfo.realValue*65/1000;
+            TransferHelper.safeTransferFrom(nftInfo.erc1, mine, tecSev, nftInfo.tecFee);
+            nftInfo.realValue = nftInfo.realValue - nftInfo.tecFee;
+            nftAutos[propId][tokenId] = NftAuto(block.timestamp,block.timestamp,nftInfo.realValue);
+        }
+        else{
+            nftInfo.tecFee = nftInfo.realValue*10/1000;
+            TransferHelper.safeTransferFrom(nftInfo.erc1, mine, tecSev, nftInfo.tecFee);
+            recommInfos[nftInfo.recomm].inviteRewardAmt[item1.itemType] += nftInfo.tecFee*4;
+            TransferHelper.safeTransferFrom(nftInfo.erc1, mine, nftInfo.recomm, nftInfo.tecFee*4);
+            nftInfo.realValue = nftInfo.realValue - nftInfo.tecFee*5;
+            nftAutos[propId][tokenId] = NftAuto(block.timestamp,block.timestamp,nftInfo.realValue);
+        }
+        if (!EquipisAccountStakeAuto(msg.sender,propId,tokenId)){
+            require(getStakeAutoCount(msg.sender)<6,"overflow 6 stake equip");
+            prop.safeTransferFrom(msg.sender,address(this),tokenId);
+            addStakeAuto(msg.sender,propId,tokenId);
+        }
+        emit FarmAuto(msg.sender,nftList[propId],tokenId,nftInfo.erc1,nftInfo.realValue,block.timestamp);  */
+    }
+    //event FarmAuto(address account,address nft,uint id,address erc20,uint value,uint time);
+
+    function earnAuto(address account,uint propId,uint tokenId) public view returns(uint ercIndex,uint earn,uint enableClaim){
+        require(EquipisAccountStakeAuto(account,propId,tokenId),"You not stake the equip");
+        EquipNFT prop = EquipNFT(nftList[propId]);
+        EquipNFT.Item memory item1;
+        (,,item1,,,,,)=prop.property();
+        ercIndex = item1.itemType;
+        NftAuto memory nftAuto = nftAutos[propId][tokenId];
+        if (nftAuto.lastClaimTime<nftAuto.startTime+48*60*60){
+            earn = nftAuto.totalReward*(nftAuto.startTime+48*60*60-nftAuto.lastClaimTime)/(48*60*60);
+            if (block.timestamp>nftAuto.startTime+48*60*60){
+                enableClaim = earn;
+            }else{
+                enableClaim = nftAuto.totalReward*(block.timestamp-nftAuto.lastClaimTime)/(48*60*60);
+            }
+        }else{
+            earn = 0;
+            enableClaim = 0;
+        }
+    }
+
+    function claimFarmAuto(uint propId,uint tokenId) public{
+        (uint ercIndex,,uint enableClaim) = earnAuto(msg.sender,propId,tokenId);
+        address erc1 = ercList[ercIndex];
+        TransferHelper.safeTransferFrom(erc1, mine, msg.sender, enableClaim);
+        nftAutos[propId][tokenId].lastClaimTime = block.timestamp;
+        emit ClaimFarmAuto(propId,tokenId,enableClaim);
+    }
+    event ClaimFarmAuto(uint propId,uint tokenId,uint vol);
+
+
+    function claimFarmAutoAllAType(uint ercIndex) public {  //claim meat 1, or wood
+        DaoFarmerLib.claimFarmAutoAllAType(nftAutos, ercIndex);
+        //(uint[] memory propTypes,uint[] memory ids) =  getAllStakeAuto(msg.sender);
+        //uint n = propTypes.length;
+        //uint[] memory vols =new uint[](n);
+        //uint totalVol = 0;
+        //uint realN=0;
+        //for (uint i=0;i<n;i++){
+        //    if (propTypeIsOutErc(propTypes[i],ercIndex)){
+        //        (,,uint enableClaim) = earnAuto(msg.sender,propTypes[i],ids[i]);
+        //        if (enableClaim>0){
+        //            vols[i] = enableClaim;
+        //            totalVol += enableClaim;
+        //            realN++;
+        //            nftAutos[propTypes[i]][ids[i]].lastClaimTime = block.timestamp;
+        //        }
+        //    }
+        //}
+        //uint[] memory propIdsRet = new uint[](realN);
+        //uint[] memory idsRet = new uint[](realN);
+        //uint[] memory volsRet =new uint[](realN);
+        //uint index=0;
+        //for (uint i=0;i<n;i++){
+        //    if (vols[i]>0){
+        //        propIdsRet[index] = propTypes[i];
+        //        idsRet[index] = ids[i];
+        //        volsRet[index] = vols[i];
+        //        index++;
+        //    }
+        //}
+        //address erc1 = ercList[ercIndex];
+        //TransferHelper.safeTransferFrom(erc1, mine, msg.sender, totalVol);
+        //emit ClaimFarmAutoAllAType(ercIndex,totalVol,propIdsRet,idsRet,volsRet);
+    }
+    //event ClaimFarmAutoAllAType(uint ercIndex,uint totalVol,uint[] propIds,uint[] tokenIds,uint[] vols);
+
+    function propTypeIsOutErc(uint propType,uint ercIndex) public pure returns(bool) {
+        if (ercIndex==FOOD) {
+            if (propType<=GUN)
+                return true;
+            else
+                return false;
+        }else if (ercIndex==WOOD) {
+            if ((propType>=AXE)&&(propType<=ESAW))
+                return true;
+            else
+                return false;
+        }else if (ercIndex==GOLD) {
+            if ((propType>=PICK)&&(propType<=RIG))
+                return true;
+            else
+                return false;
+        }else
+        return false;
+
+    }
+
+    function getPropOutErcIndex(uint propId) public pure returns(uint ercIndex){
+        if (propId<=GUN)
+            return FOOD;
+        else if(propId<=ESAW)
+            return WOOD;
+        else if(propId<=RIG)
+            return GOLD;
+        else
+            return 999;
+    }
+
+    function withdrawPropAuto(uint propId,uint tokenId) public  {
+        require(EquipisAccountStakeAuto(msg.sender,propId,tokenId),"You not stake the equip");
+        claimFarmAutoAllAType(getPropOutErcIndex(propId));
+        EquipNFT prop = EquipNFT(nftList[propId]);
+        uint coolDown;
+        uint lastTime;
+        uint totalDurability;
+        uint curDurability;
+        (,,,,totalDurability,,,coolDown)=prop.property();
+        (curDurability,lastTime) = prop.curPropertys(tokenId);
+        NftAuto memory nftAuto = nftAutos[propId][tokenId];
+        require(block.timestamp-nftAuto.startTime > (48*60*60),"cooling down");
+        require(totalDurability<=curDurability,"Durability is not full");
+        removeStakeAuto(msg.sender,propId,tokenId);
+        prop.safeTransferFrom(address(this),msg.sender,tokenId);
+        emit WithdrawPropAuto(msg.sender,nftList[propId],tokenId,block.timestamp);  
+    }
+    event WithdrawPropAuto(address account,address nft,uint id,uint time);
+
+    function addStakeAuto(address account,uint propType,uint id) public {
+           require(msg.sender == address(this),"No auth") ;
+           stakeEquipAuto[account].add(hl2u(propType,id));
+    }
+
+    function removeStakeAuto(address account,uint propType,uint id) internal {
+           stakeEquipAuto[account].remove(hl2u(propType,id));
+    }
+
+    function EquipisAccountStakeAuto(address account,uint propType,uint id) public view returns(bool){
+        uint typeAndId = hl2u(propType,id);
+        return stakeEquipAuto[account].contains(typeAndId);
+    }
+
+    function getStakeAutoCount(address account) public view returns(uint){
+        return stakeEquipAuto[account].length();
+    }
+ 
+     function getStakeAutoByIndex(address account,uint index) public view returns(uint propType,uint id){
+        (propType,id) = u2hl(stakeEquipAuto[account].at(index));
+    }
+
+    function getAllStakeAuto(address account) public view returns(uint[] memory propType,uint[] memory id){
+        uint n = stakeEquipAuto[account].length();
+        propType = new uint[](n);
+        id = new uint[](n);
+        for (uint i=0;i<n;i++){
+            (propType[i],id[i]) = u2hl(stakeEquipAuto[account].at(i));
+        }
+    }
+
+    function getAllStakeAutoAndCurInfo(address account) public view returns(uint[] memory propType,uint[] memory id,uint[] memory currDurabilitys,uint[] memory lastTimes){
+        uint n = stakeEquipAuto[account].length();
+        propType = new uint[](n);
+        id = new uint[](n);
+        currDurabilitys = new uint[](n);
+        lastTimes = new uint[](n);        
+        for (uint i=0;i<n;i++){
+            (propType[i],id[i]) = u2hl(stakeEquipAuto[account].at(i));
+            EquipNFT prop = EquipNFT(nftList[propType[i]]);    
+            (currDurabilitys[i],) = prop.curPropertys(id[i]);
+            lastTimes[i] = nftAutos[propType[i]][id[i]].startTime;
+        }
+    }
+
+
+
+//autofarm
     
-    function __DaoFarmer_init(address governor_, address vault_,address eco_,address mine_,uint begin_, uint span_) external initializer {
+    function __DaoFarmer_init(address governor_, address vault_,address eco_,address mine_,uint begin_, uint span_,address tecSev_) external initializer {
 		__Governable_init_unchained(governor_);
         __AccessControl_init_unchained();
         __AccessControlEnumerable_init_unchained();
-		__DaoFarmer_init_unchained( vault_,eco_,mine_,begin_, span_);
+		__DaoFarmer_init_unchained( vault_,eco_,mine_,begin_, span_,tecSev_);
         _setupRole(DEFAULT_ADMIN_ROLE, governor_);
         _setupRole(POWER_ROLE, governor_);
 		maxPower = 8000;
         stakeDAOFvol = 50 ether;
+        medalDAOFvol = 25 ether;
 	}
+
+    function setmedalDAOFvol(uint vol) public governance{
+        medalDAOFvol = vol;
+    }
 	
-    function __DaoFarmer_init_unchained(address vault_,address eco_,address mine_,uint begin_,uint span_) public governance {
+    function __DaoFarmer_init_unchained(address vault_,address eco_,address mine_,uint begin_,uint span_,address tecSev_) public governance {
         vault = vault_;
         eco = eco_;
         mine = mine_;
         begin = begin_;
         span =span_;
-    }    
+        tecSev = tecSev_;
+    }   
+    function setTecSev(address tecSev_) public governance {
+        tecSev = tecSev_;
+    }  
 
     function setupRole(bytes32 role, address account) public onlyRole(DEFAULT_ADMIN_ROLE){
         _setupRole(role, account);
@@ -3236,6 +3552,7 @@ contract DaoFarmer is Configurable,IERC721ReceiverUpgradeable,AccessControlEnume
     function unStakeDAOF(uint poolID) public{   //raise FOOD = 1; WOOD = 2; GOLD = 3;
         require(poolID>=FOOD && poolID<=GOLD,"No the pool");
         require(poolStakes[poolID][msg.sender]>0,"no stake the pool");
+        require(poolStakeEndTime[poolID][msg.sender]<=block.timestamp,"autoFarm cooling down...");
         address erc1 = ercList[DAOF];
         uint vol = poolStakes[poolID][msg.sender];
         TransferHelper.safeTransfer(erc1, msg.sender,vol);
@@ -3337,7 +3654,7 @@ contract DaoFarmer is Configurable,IERC721ReceiverUpgradeable,AccessControlEnume
         }
     }
 
-    //0 DAOF:200, 1 DFM:10000, 2 DFW:150000, 3 DFG:150000  WUSD:50000；
+    //0 DAOF:200, 1 DFM:10000, 2 DFW:150000, 3 DFG:150000  WUSD:50000锛?
     /*function getTestToken() public {
         for (uint i = 0; i < 4; i++) {
             address erc1 = ercList[i];
@@ -3409,4 +3726,113 @@ library TransferHelper {
         (bool success,) = to.call{value:value}(new bytes(0)); //(bool success,) = to.call.value(value)(new bytes(0));           
         require(success, 'TransferHelper: ETH_TRANSFER_FAILED');
     }
+}
+
+struct NftInfo{
+        uint costPower;
+        uint coolDown;
+        uint costDurability;
+        uint curDurability;
+        uint lastTime;
+        uint times;
+        address erc1;
+        uint fee;
+        uint realValue;
+        uint tecFee;
+        address recomm;
+}
+
+library DaoFarmerLib {
+    function farmAuto(mapping(uint =>mapping(uint =>DaoFarmer.NftAuto)) storage nftAutos, mapping(address =>DaoFarmer.RecommInfo) storage recommInfos,mapping (uint =>mapping(address =>uint)) storage poolStakeEndTime, uint propId,uint tokenId) public  {
+        DaoFarmer df = DaoFarmer(address(this));
+        EquipNFT prop = EquipNFT(df.nftList(propId));
+        EquipNFT.Item memory item1;
+        NftInfo memory nftInfo;
+       // df.farmAutoNum[msg.sender] += 1;
+        (,,item1,,,nftInfo.costDurability,nftInfo.costPower,nftInfo.coolDown)=prop.property();
+        (nftInfo.curDurability,nftInfo.lastTime) = prop.curPropertys(tokenId);
+        require(block.timestamp-nftInfo.lastTime >nftInfo.coolDown,"cooling down");
+        nftInfo.times = 48*60*60/nftInfo.coolDown;
+        prop.costDur(tokenId,true);
+        prop.setDur(tokenId,nftInfo.curDurability - nftInfo.costDurability*nftInfo.times);
+        uint meatVol = nftInfo.costPower*nftInfo.times*1e18/5;
+        TransferHelper.safeTransferFrom(df.ercList(1), msg.sender, df.BurnAddress(), meatVol);
+
+
+        nftInfo.erc1 = df.ercList(item1.itemType);
+        uint value1 = item1.value*nftInfo.times;
+        if (df.poolStakes(item1.itemType,msg.sender)>=df.stakeDAOFvol()){ //stake
+            poolStakeEndTime[item1.itemType][msg.sender] = block.timestamp+48*60*60;
+            value1 = value1*106/100;
+        }
+        nftInfo.fee =value1*4/100;
+        nftInfo.realValue = value1 - 2*nftInfo.fee;  //92%
+
+
+        TransferHelper.safeTransferFrom(nftInfo.erc1, df.mine(), df.vault(), nftInfo.fee);
+        TransferHelper.safeTransferFrom(nftInfo.erc1, df.mine(), df.eco(), nftInfo.fee);
+
+        //no recommender 6.5% tecsev
+        //recommender 4% ,  1% tecsev
+        nftInfo.recomm = df.recommenders(msg.sender);
+        if (nftInfo.recomm == address(0)){
+            nftInfo.tecFee = nftInfo.realValue*65/1000;
+            TransferHelper.safeTransferFrom(nftInfo.erc1, df.mine(), df.tecSev(), nftInfo.tecFee);
+            nftInfo.realValue = nftInfo.realValue - nftInfo.tecFee;
+            nftAutos[propId][tokenId] = DaoFarmer.NftAuto(block.timestamp,block.timestamp,nftInfo.realValue);
+        }
+        else{
+            nftInfo.tecFee = nftInfo.realValue*10/1000;
+            TransferHelper.safeTransferFrom(nftInfo.erc1, df.mine(), df.tecSev(), nftInfo.tecFee);
+            recommInfos[nftInfo.recomm].inviteRewardAmt[item1.itemType] += nftInfo.tecFee*4;
+            TransferHelper.safeTransferFrom(nftInfo.erc1, df.mine(), nftInfo.recomm, nftInfo.tecFee*4);
+            nftInfo.realValue = nftInfo.realValue - nftInfo.tecFee*5;
+            nftAutos[propId][tokenId] = DaoFarmer.NftAuto(block.timestamp,block.timestamp,nftInfo.realValue);
+        }
+        if (!df.EquipisAccountStakeAuto(msg.sender,propId,tokenId)){
+            require(df.getStakeAutoCount(msg.sender)<6,"overflow 6 stake equip");
+            prop.safeTransferFrom(msg.sender,address(this),tokenId);
+            df.addStakeAuto(msg.sender,propId,tokenId);
+          
+        }
+        emit FarmAuto(msg.sender,df.nftList(propId),tokenId,nftInfo.erc1,nftInfo.realValue,block.timestamp);  
+    }
+    event FarmAuto(address account,address nft,uint id,address erc20,uint value,uint time);
+
+
+    function claimFarmAutoAllAType(mapping(uint =>mapping(uint =>DaoFarmer.NftAuto)) storage nftAutos, uint ercIndex) external {
+        DaoFarmer df = DaoFarmer(address(this));
+        (uint[] memory propTypes,uint[] memory ids) =  df.getAllStakeAuto(msg.sender);
+        uint n = propTypes.length;
+        uint[] memory vols =new uint[](n);
+        uint totalVol = 0;
+        uint realN=0;
+        for (uint i=0;i<n;i++){
+            if (df.propTypeIsOutErc(propTypes[i],ercIndex)){
+                (,,uint enableClaim) = df.earnAuto(msg.sender,propTypes[i],ids[i]);
+                if (enableClaim>0){
+                    vols[i] = enableClaim;
+                    totalVol += enableClaim;
+                    realN++;
+                    nftAutos[propTypes[i]][ids[i]].lastClaimTime = block.timestamp;
+                }
+            }
+        }
+        uint[] memory propIdsRet = new uint[](realN);
+        uint[] memory idsRet = new uint[](realN);
+        uint[] memory volsRet =new uint[](realN);
+        uint index=0;
+        for (uint i=0;i<n;i++){
+            if (vols[i]>0){
+                propIdsRet[index] = propTypes[i];
+                idsRet[index] = ids[i];
+                volsRet[index] = vols[i];
+                index++;
+            }
+        }
+        address erc1 = df.ercList(ercIndex);
+        TransferHelper.safeTransferFrom(erc1, df.mine(), msg.sender, totalVol);
+        emit ClaimFarmAutoAllAType(ercIndex,totalVol,propIdsRet,idsRet,volsRet);
+    }
+    event ClaimFarmAutoAllAType(uint ercIndex,uint totalVol,uint[] propIds,uint[] tokenIds,uint[] vols);
 }
